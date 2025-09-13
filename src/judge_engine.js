@@ -15,15 +15,15 @@ export class JudgeEngine {
         this.submissionManager = config.submissionManager;
         this.testlibPath = config.testlibPath || '/lib/testlib';
         
-        // 内存队列与结果
+        // In-memory queue and results
         this.queue = [];
         this.results = new Map();
         
-        // 启动工作线程
+        // Start worker threads
         this.startWorkers(config.workers || 4);
     }
 
-    // 提交任务
+    // Submit a task
     async submit(pid, lang, code) {
         const sid = await this.submissionManager.nextSubmissionId();
         this.results.set(sid, { status: 'queued' });
@@ -49,44 +49,45 @@ export class JudgeEngine {
         return sid;
     }
 
-    // 获取结果
-    async getResult(sid) {
+    // Get the result
+    getResult(sid) {
         const r = this.results.get(sid);
         if (r) {
-            this.results.delete(sid);
+            // Only delete the result from the cache if it's a final state
+            if (r.status === 'done' || r.status === 'error') {
+                this.results.delete(sid);
+            }
             return r;
         }
 
         try {
             const { subDir } = this.submissionManager.submissionPaths(sid);
-            const txt = await fs.readFile(path.join(subDir, 'result.json'), 'utf8');
+            const txt = fs.readFileSync(path.join(subDir, 'result.json'), 'utf8');
             return JSON.parse(txt);
         } catch {
             return null;
         }
     }
 
-    // 清空结果缓存
+    // Clear the results cache
     clearResults() {
         this.results.clear();
     }
 
-    // 判题单个测试点
+    // Judge a single test case
     async judgeCase({ runSpec, caseItem, problem, checkerId }) {
-        // 读取输入输出文件
+        // Read input and answer files
         const inf = await this.problemManager.readTestFile(problem.pdir.split('/').pop(), caseItem.input);
         
         let ans;
         try {
-            // 尝试读取 .ans 文件
             const ansFile = caseItem.output.replace(/\.out$/, '.ans');
             ans = await this.problemManager.readTestFile(problem.pdir.split('/').pop(), ansFile);
         } catch {
-            // 如果没有 .ans 文件，读取 .out 文件
             ans = await this.problemManager.readTestFile(problem.pdir.split('/').pop(), caseItem.output);
         }
 
-        // 选手程序运行
+        // Run the contestant's program
         const runRes = await this.goJudge.runOne({
             args: runSpec.runArgs,
             env: ['PATH=/usr/bin:/bin'],
@@ -117,12 +118,12 @@ export class JudgeEngine {
 
         const out = runRes.files?.stdout ?? '';
         
-        // checker（testlib）运行：chk in.txt out.txt ans.txt
+        // Run the checker (testlib)
         const chkRes = await this.goJudge.runOne({
             args: ['chk', 'in.txt', 'out.txt', 'ans.txt'],
             env: ['PATH=/usr/bin:/bin'],
             files: [{ content: '' }, { name: 'stdout', max: 1024 * 1024 }, { name: 'stderr', max: 1024 * 1024 }],
-            cpuLimit: 10e9,
+            cpuLimit: 10e9, // 10 seconds
             clockLimit: 20e9,
             memoryLimit: 256 << 20,
             stackLimit: 256 << 20,
@@ -135,7 +136,6 @@ export class JudgeEngine {
             }
         });
 
-        console.log('Checker result:', chkRes);
         const ok = chkRes.status === 'Accepted' && chkRes.exitStatus === 0;
         return {
             ok,
@@ -151,57 +151,39 @@ export class JudgeEngine {
         
         let ans;
         try {
-            // 尝试读取 .ans 文件
             const ansFile = caseItem.output.replace(/\.out$/, '.ans');
             ans = await this.problemManager.readTestFile(problem.pdir.split('/').pop(), ansFile);
         } catch {
-            // 如果没有 .ans 文件，读取 .out 文件
             ans = await this.problemManager.readTestFile(problem.pdir.split('/').pop(), caseItem.output);
         }
 
-        // 选手程序运行
-        // 运行：两进程 + 双向管道
+        // Run interactive judging
         const interactRes = await this.goJudge.run({
             cmd: [
-                // index: 0 -> 选手程序
-                {
+                { // Contestant's program
                     args: runSpec.runArgs,
                     env: ['PATH=/usr/bin:/bin'],
-                    // 注意：stdout 将被管道接走，因此这里设为 null；只保留 stderr 便于调试
-                    files: [
-                        null,                         // stdin (由 interactor 输出驱动)
-                        null,                                    // stdout (被管道映射)
-                        { name: 'stderr', max: 1024*1024 }  // stderr 捕获
-                    ],
+                    files: [null, null, { name: 'stderr', max: 1024*1024 }],
                     cpuLimit: toNs(caseItem.time),
                     clockLimit: toNs(caseItem.time) * 2,
                     memoryLimit: toBytes(caseItem.memory),
                     stackLimit: toBytes(caseItem.memory),
                     procLimit: 128,
                     copyIn: { ...runSpec.preparedCopyIn },
-                    // 可选：工作目录/uid 限制等
                 },
-
-                // index: 1 -> interactor
-                {
-                    // 假设 interactor 可执行名为 "interactor"，参数习惯：interactor in.txt ans.txt
+                { // Interactor
                     args: ['interactor', 'in.txt', 'tout.txt', 'ans.txt'],
                     env: ['PATH=/usr/bin:/bin'],
-                    // interactor 读取 stdin（来自选手 stdout），把输出写回到 stdout（供选手 stdin）
-                    files: [
-                        null,                               // stdin (来自选手 stdout 的管道)
-                        null,                                          // stdout (被管道映射给选手 stdin)
-                        { name: 'stderr', max: 1024*1024 }    // stderr 通常输出判定/日志
-                    ],
+                    files: [null, null, { name: 'stderr', max: 1024*1024 }],
                     cpuLimit: toNs(caseItem.time) * 4,
                     clockLimit: toNs(caseItem.time) * 4 * 2,
                     memoryLimit: toBytes(caseItem.memory) * 4,
                     stackLimit: toBytes(caseItem.memory) * 4,
                     procLimit: 128,
                     copyIn: {
-                        'interactor': { fileId: interactorId }, // 放入可执行体
-                        'in.txt': { content: inf },             // 题面输入交给 interactor
-                        'ans.txt': { content: ans }             // 如题面需要参考答案/数据
+                        'interactor': { fileId: interactorId },
+                        'in.txt': { content: inf },
+                        'ans.txt': { content: ans }
                     }
                 }
             ],
@@ -214,41 +196,27 @@ export class JudgeEngine {
         const submissionRes = interactRes[0];
         const interactorRes = interactRes[1];
 
-        if (submissionRes.status === 'Accepted' && interactorRes.status === 'Accepted' 
-            && interactorRes.exitStatus === 0 && submissionRes.exitStatus === 0 ) {
+        if (submissionRes.status === 'Accepted' && interactorRes.status === 'Accepted' && interactorRes.exitStatus === 0 && submissionRes.exitStatus === 0 ) {
             return {
                 ok: true,
                 status: 'Accepted',
                 time: submissionRes.runTime,
                 memory: Math.max(submissionRes.memory, interactorRes.memory),
-                msg: (interactorRes.files?.stdout || '') + (interactorRes.files?.stderr || '') // interactor 的 stdout/stderr 可能有日志
+                msg: (interactorRes.files?.stdout || '') + (interactorRes.files?.stderr || '')
             };
         }
         if (submissionRes.status !== 'Accepted') {
-            let extra = '';
-            if (submissionRes.status === 'Signalled') {
-                extra = ` (signal=${submissionRes.error || 'unknown'})`;
-            }
-            return { 
-                ok: false, 
-                status: submissionRes.status, 
-                time: submissionRes.runTime, 
-                memory: submissionRes.memory, 
-                msg: (submissionRes.files?.stderr || '' ) + extra
-            };
+            let extra = (submissionRes.status === 'Signalled') ? ` (signal=${submissionRes.error || 'unknown'})` : '';
+            return { ok: false, status: submissionRes.status, time: submissionRes.runTime, memory: submissionRes.memory, msg: (submissionRes.files?.stderr || '') + extra };
         }
         if (interactorRes.status !== 'Accepted') {
-            return { 
-                ok: false, 
-                status: interactorRes.status, 
-                time: submissionRes.runTime, 
-                memory: submissionRes.memory, 
-                msg: (interactorRes.files?.stderr || '' )
-            };
+            return { ok: false, status: interactorRes.status, time: submissionRes.runTime, memory: submissionRes.memory, msg: (interactorRes.files?.stderr || '') };
         }
+        // Default to WA if interactor exits non-zero
+        return { ok: false, status: 'Wrong Answer', time: submissionRes.runTime, memory: submissionRes.memory, msg: (interactorRes.files?.stderr || '') };
     }
 
-    // 启动工作线程
+    // Start worker threads
     startWorkers(workerCount) {
         for (let i = 0; i < workerCount; i++) {
             this.startWorker();
@@ -259,45 +227,47 @@ export class JudgeEngine {
         let cleanupIds = [];
         let checkerCleanup, checkerId;
         try {
-            // 准备选手程序（沙箱内编译/缓存）
-            const runSpec = await this.goJudge.prepareProgram({ 
-                lang, 
-                code, 
-                mainName: problem.filename || null 
-            });
+            // Prepare contestant's program
+            const runSpec = await this.goJudge.prepareProgram({ lang, code, mainName: problem.filename || null });
             cleanupIds.push(...(runSpec.cleanupIds || []));
 
-            
-            // 读取 checker.bin 文件（如果存在）
+            // Prepare checker
             const checkerBinPath = path.join(problem.pdir, `${problem.checker}.bin`);
             let checkerResult;
             if (await fileExists(checkerBinPath)) {
                 checkerResult = await this.goJudge.copyInBin(checkerBinPath);
-                checkerId = checkerResult.binId;
-                checkerCleanup = checkerResult.cleanup;
             } else if (problem.checker) {
-                // 否则读取 checker 源码并编译
                 const chkSrc = await this.problemManager.readCheckerSource(pid, problem.checker);
                 checkerResult = await this.goJudge.prepareChecker(chkSrc, this.testlibPath);
-                checkerId = checkerResult.checkerId;
-                checkerCleanup = checkerResult.cleanup;
             }
+            checkerId = checkerResult.binId || checkerResult.checkerId;
+            checkerCleanup = checkerResult.cleanup;
 
-            // 逐测试点（遇到非 AC 早停）
+            // Run all cases
+            let totalScore = 0;
             const caseResults = [];
-            let firstBad = null;
             for (const c of problem.cases) {
                 const r = await this.judgeCase({ runSpec, caseItem: c, problem, checkerId });
+                
+                const match = r.msg.match(/Ratio: (\d\.\d+)/);
+                r.scoreRatio = match ? parseFloat(match[1]) : (r.ok ? 1.0 : 0);
+                
+                totalScore += r.scoreRatio;
                 caseResults.push(r);
-                if (!r.ok) { 
-                    firstBad = r; 
-                    break; 
-                }
             }
-            const passed = firstBad === null;
-            const result = caseResults[caseResults.length - 1].status || 'Unknown';
+            
+            // The overall "passed" status depends on all cases achieving a perfect score ratio
+            const passed = caseResults.every(r => r.scoreRatio === 1.0);
+            const overallResult = passed ? 'Correct Answer' : 'Wrong Answer';
+            const finalScore = problem.cases.length > 0 ? (totalScore / problem.cases.length) * 100 : 0;
 
-            const final = { status: 'done', passed, result, cases: caseResults };
+            // Remap individual case statuses based on scoreRatio
+            const finalCases = caseResults.map(caseResult => ({
+                ...caseResult,
+                status: caseResult.scoreRatio === 1.0 ? 'Correct' : 'Wrong Answer'
+            }));
+
+            const final = { status: 'done', passed, result: overallResult, score: Math.round(finalScore), cases: finalCases };
             this.results.set(sid, final);
             await fs.writeFile(path.join(subDir, 'result.json'), JSON.stringify(final, null, 2));
         } catch (e) {
@@ -305,13 +275,8 @@ export class JudgeEngine {
             this.results.set(sid, err);
             await fs.writeFile(path.join(subDir, 'result.json'), JSON.stringify(err, null, 2));
         } finally {
-            // 清理 go-judge 缓存文件
-            for (const id of cleanupIds) {
-                await this.goJudge.deleteFile(id);
-            }
-            if (checkerCleanup) {
-                await checkerCleanup();
-            }
+            for (const id of cleanupIds) await this.goJudge.deleteFile(id);
+            if (checkerCleanup) await checkerCleanup();
         }
     }
 
@@ -319,45 +284,45 @@ export class JudgeEngine {
         let cleanupIds = [];
         let interactorCleanup, interactorId;
         try {
-            // 准备选手程序（沙箱内编译/缓存）
-            console.log('Preparing interactive program...');
-            const runSpec = await this.goJudge.prepareProgram({ 
-                lang,
-                code,
-                mainName: problem.filename || null
-            });
+            // Prepare program and interactor
+            const runSpec = await this.goJudge.prepareProgram({ lang, code, mainName: problem.filename || null });
             cleanupIds.push(...(runSpec.cleanupIds || []));
-
-            // 读取 interactor.bin 文件（如果存在）
             const interactorBinPath = path.join(problem.pdir, `${problem.interactor}.bin`);
             let interactorResult;
             if (await fileExists(interactorBinPath)) {
                 interactorResult = await this.goJudge.copyInBin(interactorBinPath);
-                interactorId = interactorResult.binId;
-                interactorCleanup = interactorResult.cleanup;
             } else if (problem.interactor) {
-                // 否则读取 interactor 源码并编译
                 const interSrc = await this.problemManager.readInteractorSource(pid, problem.interactor);
                 interactorResult = await this.goJudge.prepareInteractor(interSrc, this.testlibPath);
-                interactorId = interactorResult.interactorId;
-                interactorCleanup = interactorResult.cleanup;
             }
+            interactorId = interactorResult.binId || interactorResult.interactorId;
+            interactorCleanup = interactorResult.cleanup;
 
-            // 逐测试点（遇到非 AC 早停）
+            // Run all cases and calculate score
+            let totalScore = 0;
             const caseResults = [];
-            let firstBad = null;
             for (const c of problem.cases) {
                 const r = await this.judgeInteractiveCase({ runSpec, caseItem: c, problem, interactorId });
+                
+                // Parse score ratio from interactor message
+                const match = r.msg.match(/Ratio: (\d\.\d+)/);
+                r.scoreRatio = match ? parseFloat(match[1]) : (r.ok ? 1.0 : 0);
+                
+                totalScore += r.scoreRatio;
                 caseResults.push(r);
-                if (!r.ok) { 
-                    firstBad = r; 
-                    break; 
-                }
             }
-            const passed = firstBad === null;
-            const result = caseResults[caseResults.length - 1].status || 'Unknown';
 
-            const final = { status: 'done', passed, result, cases: caseResults };
+            const passed = caseResults.every(r => r.scoreRatio === 1.0);
+            const overallResult = passed ? 'Correct Answer' : 'Wrong Answer';
+            const finalScore = problem.cases.length > 0 ? (totalScore / problem.cases.length) * 100 : 0;
+
+            // Remap individual case statuses for clarity
+            const finalCases = caseResults.map(caseResult => ({
+                ...caseResult,
+                status: caseResult.scoreRatio === 1.0 ? 'Correct' : 'Wrong Answer'
+            }));
+
+            const final = { status: 'done', passed, result: overallResult, score: Math.round(finalScore), cases: finalCases };
             this.results.set(sid, final);
             await fs.writeFile(path.join(subDir, 'result.json'), JSON.stringify(final, null, 2));
         } catch (e) {
@@ -365,17 +330,12 @@ export class JudgeEngine {
             this.results.set(sid, err);
             await fs.writeFile(path.join(subDir, 'result.json'), JSON.stringify(err, null, 2));
         } finally {
-            // 清理 go-judge 缓存文件
-            for (const id of cleanupIds) {
-                await this.goJudge.deleteFile(id);
-            }
-            if (interactorCleanup) {
-                await interactorCleanup();
-            }
+            for (const id of cleanupIds) await this.goJudge.deleteFile(id);
+            if (interactorCleanup) await interactorCleanup();
         }
     }
 
-    // 单个工作线程
+    // A single worker thread
     async startWorker() {
         while (true) {
             const job = this.queue.shift();
@@ -385,7 +345,7 @@ export class JudgeEngine {
             }
 
             let { sid, pid, lang, code } = job;
-            const { bucketDir, subDir } = this.submissionManager.submissionPaths(sid);
+            const { subDir } = this.submissionManager.submissionPaths(sid);
             if (typeof code !== 'string') {
                 code = await fs.readFile(path.join(subDir, 'source.code'), 'utf8');
             } else {
@@ -398,11 +358,8 @@ export class JudgeEngine {
                 case 'interactive':
                     await this.judgeInteractive(problem, sid, pid, lang, code, subDir);
                     break;
-
                 case 'leetcode':
                     throw new Error('LeetCode problems are not supported for now.');
-                    break;
-
                 default:
                     await this.judgeDefault(problem, sid, pid, lang, code, subDir);
                     break;
@@ -410,7 +367,6 @@ export class JudgeEngine {
         }
     }
 
-    // 根据语言获取源文件名
     getSourceFileName(lang) {
         switch (lang) {
             case 'cpp': return 'main.cpp';
@@ -421,3 +377,4 @@ export class JudgeEngine {
         }
     }
 }
+
